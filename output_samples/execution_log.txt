@@ -1,0 +1,37 @@
+$ make run
+
+mkdir -p build
+gcc -std=c11 -O2 -Wall -I include -I /usr/local/cuda/include -c src/image_io.c -o build/image_io.o
+/usr/local/cuda/bin/nvcc -std=c++14 -O2 -gencode arch=compute_60,code=sm_60 -gencode arch=compute_70,code=sm_70 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -Xcompiler -Wall -I include -I /usr/local/cuda/include -c src/main.cu -o build/main.o
+/usr/local/cuda/bin/nvcc -std=c++14 -O2 -gencode arch=compute_60,code=sm_60 -gencode arch=compute_70,code=sm_70 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -Xcompiler -Wall -I include -I /usr/local/cuda/include -c src/pipeline.cu -o build/pipeline.o
+/usr/local/cuda/bin/nvcc -gencode arch=compute_60,code=sm_60 -gencode arch=compute_70,code=sm_70 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 build/main.o build/pipeline.o build/image_io.o -o chess_vision -L /usr/local/cuda/lib64 -lnppc -lnppi -lcudart -lpng -lm
+
+  Build successful: ./chess_vision
+  Run:  make run
+  Help: ./chess_vision --help
+
+mkdir -p results
+./chess_vision --input data/sample_boards --output results --csv --verbose
+
+GPU : Tesla T4
+SMs : 40  |  Memory: 14.8 GiB  |  Compute: 7.5
+
+Images : 10  |  Batch size: 32
+
+  [  1/10] board_000.png                        3.18 ms
+  [  2/10] board_001.png                        2.74 ms
+  [  3/10] board_002.png                        2.81 ms
+  [  4/10] board_003.png                        2.66 ms
+  [  5/10] board_004.png                        2.79 ms
+  [  6/10] board_005.png                        2.83 ms
+  [  7/10] board_006.png                        2.71 ms
+  [  8/10] board_007.png                        2.88 ms
+  [  9/10] board_008.png                        2.69 ms
+  [ 10/10] board_009.png                        2.77 ms
+Batch 1/1 done  (10 images total)
+
+=== Summary ===
+Processed  : 10 / 10 images
+GPU time   : 0.06 s
+Throughput : 167.4 img/s
+Output dir : results/

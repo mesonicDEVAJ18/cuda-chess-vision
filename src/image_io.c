@@ -1,5 +1,6 @@
-// image_io.c — PNG image I/O using libpng
-// Compile with: gcc -c image_io.c -I../include -lpng
+// image_io.c — PNG image I/O using libpng, CSV export, directory scanning
+
+#define _POSIX_C_SOURCE 200809L   // enables strdup, readdir, etc.
 
 #include "image_io.h"
 
@@ -17,7 +18,6 @@ int image_load_png(const char *path, Image *img) {
         return 0;
     }
 
-    // Verify PNG signature
     uint8_t sig[8];
     if (fread(sig, 1, 8, fp) != 8 || png_sig_cmp(sig, 0, 8)) {
         fprintf(stderr, "[image_io] Not a valid PNG: %s\n", path);
@@ -46,28 +46,27 @@ int image_load_png(const char *path, Image *img) {
     int color_type = png_get_color_type(png, info);
     int bit_depth  = png_get_bit_depth(png, info);
 
-    // Normalize to 8-bit RGB
-    if (bit_depth == 16)                      png_set_strip_16(png);
-    if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
-    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png);
-    if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
-    // Strip alpha, convert gray to RGB
-    if (color_type == PNG_COLOR_TYPE_RGBA)    png_set_strip_alpha(png);
-    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
-        png_set_gray_to_rgb(png);
+    if (bit_depth == 16)                          png_set_strip_16(png);
+    if (color_type == PNG_COLOR_TYPE_PALETTE)     png_set_palette_to_rgb(png);
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8)
+                                                  png_set_expand_gray_1_2_4_to_8(png);
+    if (png_get_valid(png, info, PNG_INFO_tRNS))  png_set_tRNS_to_alpha(png);
+    if (color_type & PNG_COLOR_MASK_ALPHA)        png_set_strip_alpha(png);
+    if (color_type == PNG_COLOR_TYPE_GRAY ||
+        color_type == PNG_COLOR_TYPE_GRAY_ALPHA)  png_set_gray_to_rgb(png);
 
     png_read_update_info(png, info);
 
-    // Allocate row pointers
-    png_bytep *rows = (png_bytep *)malloc(height * sizeof(png_bytep));
     size_t row_bytes = png_get_rowbytes(png, info);
     uint8_t *data = (uint8_t *)malloc(height * row_bytes);
+    if (!data) { png_destroy_read_struct(&png, &info, NULL); fclose(fp); return 0; }
 
+    png_bytep *rows = (png_bytep *)malloc(height * sizeof(png_bytep));
+    if (!rows) { free(data); png_destroy_read_struct(&png, &info, NULL); fclose(fp); return 0; }
     for (int y = 0; y < height; y++)
         rows[y] = data + y * row_bytes;
 
     png_read_image(png, rows);
-
     png_destroy_read_struct(&png, &info, NULL);
     fclose(fp);
     free(rows);
@@ -140,6 +139,8 @@ char **collect_png_files(const char *dir, int *count) {
     rewinddir(d);
 
     char **paths = (char **)malloc(n * sizeof(char *));
+    if (!paths) { closedir(d); *count = 0; return NULL; }
+
     int i = 0;
     while ((entry = readdir(d)) != NULL && i < n) {
         if (is_png(entry->d_name)) {
@@ -156,8 +157,7 @@ char **collect_png_files(const char *dir, int *count) {
 int save_intensity_csv(const char *path, const float *intensities) {
     FILE *f = fopen(path, "w");
     if (!f) return 0;
-    const char *files_label = "rank,a,b,c,d,e,f,g,h\n";
-    fputs(files_label, f);
+    fputs("rank,a,b,c,d,e,f,g,h\n", f);
     for (int r = 7; r >= 0; r--) {
         fprintf(f, "%d", r + 1);
         for (int c = 0; c < 8; c++)

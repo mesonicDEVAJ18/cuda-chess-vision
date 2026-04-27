@@ -1,6 +1,7 @@
 #pragma once
-// image_io.h — PNG image I/O using libpng (no external stb dependency)
+// image_io.h — PNG I/O via libpng + CSV/directory utilities
 
+#define _POSIX_C_SOURCE 200809L
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -8,37 +9,18 @@
 extern "C" {
 #endif
 
-// RGBA pixel (4 bytes per pixel, alpha always 255 for grayscale/RGB images)
 typedef struct {
-    uint8_t r, g, b, a;
-} Pixel;
-
-// Image structure
-typedef struct {
-    uint8_t *data;   // packed RGB or grayscale bytes
+    uint8_t *data;    // packed RGB (3 bytes/pixel)
     int      width;
     int      height;
-    int      channels; // 1 = gray, 3 = RGB
+    int      channels; // always 3 after load
 } Image;
 
-// Load PNG from file. Returns 1 on success, 0 on failure.
-// On success, img->data is malloc'd (caller must free).
-// Loaded image is always converted to RGB (3 channels).
-int image_load_png(const char *path, Image *img);
-
-// Save grayscale (1-channel) image as PNG. Returns 1 on success.
-int image_save_png_gray(const char *path, const uint8_t *data, int width, int height);
-
-// Free image data
-void image_free(Image *img);
-
-// Collect all .png files in a directory.
-// Returns malloc'd array of malloc'd strings. *count set to array length.
-// Caller must free each string and the array.
-char **collect_png_files(const char *dir, int *count);
-
-// Save 8x8 float array as CSV (chess board intensity grid)
-int save_intensity_csv(const char *path, const float *intensities);
+int    image_load_png      (const char *path, Image *img);
+int    image_save_png_gray (const char *path, const uint8_t *data, int w, int h);
+void   image_free          (Image *img);
+char **collect_png_files   (const char *dir, int *count);
+int    save_intensity_csv  (const char *path, const float *intensities);
 
 #ifdef __cplusplus
 }

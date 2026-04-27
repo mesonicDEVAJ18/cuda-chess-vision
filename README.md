@@ -1,12 +1,25 @@
 # CUDA Chess Vision
 
-GPU-accelerated batch image processing pipeline for chess board images, built with CUDA and NVIDIA NPP (Performance Primitives).
-
-Processes hundreds of chess board PNG images through a multi-stage GPU pipeline: RGB→grayscale conversion, Gaussian blur, Sobel edge detection, histogram equalization, and per-square intensity extraction. Each board's 8×8 grid of squares is analyzed and exported as a CSV signal.
+GPU-accelerated chess board image processing and position evaluation pipeline using four CUDA GPU libraries working together: **NPP**, **cuBLAS**, **cuFFT**, and **Thrust**.
 
 ---
 
-## Project Structure
+## What it does
+
+Takes a directory of chess board PNG images and runs them through a two-stage GPU pipeline:
+
+**Stage 1 — Image Processing (NPP + custom CUDA kernels)**
+Each image goes through: RGB→grayscale → Gaussian blur → Sobel edge detection → gradient magnitude (custom kernel) → histogram equalization (custom kernels) → per-square intensity extraction (custom kernel). The result is a processed grayscale image and a 64-value intensity map — one float per chess square — representing how bright each square is after processing.
+
+**Stage 2 — Board Evaluation (cuBLAS + cuFFT + Thrust)**
+The 64-value intensity maps from all boards are evaluated in batch:
+- **cuBLAS** (`cublasSgemm`) — multiplies the [N×64] intensity matrix by a [64×4] piece-square weight matrix, scoring each board across four features: material balance, king safety, pawn structure, and piece activity
+- **cuFFT** (`cufftExecR2C`) — runs a real-to-complex FFT on the pawn row of each board; high-frequency energy indicates a fragmented pawn structure
+- **Thrust** (`thrust::sort_by_key`) — sorts all boards by evaluation score in parallel and assigns ranks
+
+---
+
+## Project structure
 
 ```
 cuda-chess-vision/
@@ -14,19 +27,22 @@ cuda-chess-vision/
 ├── Makefile
 ├── run.sh
 ├── include/
-│   ├── image_io.h          # PNG I/O interface (libpng)
-│   └── pipeline.h          # GPU pipeline interface
+│   ├── image_io.h          # PNG I/O interface
+│   ├── pipeline.h          # NPP pipeline interface
+│   └── evaluator.h         # cuBLAS/cuFFT/Thrust evaluator interface
 ├── src/
-│   ├── main.cu             # Entry point, CLI, batch loop
-│   ├── pipeline.cu         # GPU pipeline (NPP + custom kernels)
-│   └── image_io.c          # PNG load/save via libpng, CSV export
+│   ├── main.cu             # Entry point, CLI, two-stage orchestration
+│   ├── pipeline.cu         # Stage 1: NPP + 4 custom CUDA kernels
+│   ├── evaluator.cu        # Stage 2: cuBLAS + cuFFT + Thrust
+│   └── image_io.c          # PNG load/save (libpng), CSV, directory scan
 ├── scripts/
-│   ├── generate_boards.py  # Generate synthetic board images (stdlib only)
-│   └── visualize.py        # Plot intensity heatmaps (requires matplotlib)
+│   ├── generate_boards.py  # Generate synthetic board PNGs (stdlib only)
+│   └── visualize.py        # Plot heatmaps and evaluation rankings
 ├── data/
 │   └── sample_boards/      # 10 pre-generated 512×512 board PNGs
 └── output_samples/         # Example outputs committed to repo
     ├── execution_log.txt
+    ├── evaluation.csv
     └── intensity_board_000.csv
 ```
 
@@ -35,24 +51,19 @@ cuda-chess-vision/
 ## Requirements
 
 - NVIDIA GPU (Compute Capability 6.0+; tested on T4 = sm_75)
-- CUDA Toolkit 11.x or 12.x (provides `nvcc`, `libnppc`, `libnppi`)
-- libpng development headers: `sudo apt-get install libpng-dev` (Linux) 
-  Windows: 
-  git clone https://github.com/microsoft/vcpkg
-  cd vcpkg
-  .\bootstrap-vcpkg.bat
+- CUDA Toolkit 11.x or 12.x
+- libpng development headers
 
-  .\vcpkg install libpng:x64-windows
-  .\vcpkg integrate install
-- GCC 9+
+```bash
+sudo apt-get install libpng-dev build-essential
+```
 
 ### Check your environment
 
 ```bash
 nvcc --version
 nvidia-smi
-ls /usr/local/cuda/lib64/libnpp*
-dpkg -l libpng-dev
+ls /usr/local/cuda/lib64/libnpp* /usr/local/cuda/lib64/libcublas* /usr/local/cuda/lib64/libcufft*
 ```
 
 ---
@@ -63,28 +74,25 @@ dpkg -l libpng-dev
 make
 ```
 
-Debug build (with `-G -g`):
-
 ```bash
-make debug
+sudo apt-get install gcc-12   # preferred
+# OR just run make — it falls back automatically with -allow-unsupported-compiler
 ```
 
-Clean:
+If CUDA is not at `/usr/local/cuda`:
 
 ```bash
-make clean
+make CUDA_PATH=/usr/local/cuda-12.x
 ```
 
 ---
 
 ## Run
 
-### Quick start (sample data included)
-
 ```bash
 make run
-# or equivalently:
-bash run.sh
+# equivalent to:
+./chess_vision --input data/sample_boards --output results --csv --verbose
 ```
 
 ### Full CLI
@@ -92,111 +100,93 @@ bash run.sh
 ```bash
 ./chess_vision --input <dir> [OPTIONS]
 
-Options:
-  --input   <dir>   Directory of input PNG images  (required)
-  --output  <dir>   Output directory               (default: results)
-  --batch   <N>     Images per batch               (default: 32)
-  --csv             Export per-square intensity CSVs
-  --verbose         Print per-image GPU timing
+  --input   <dir>   PNG image directory        (required)
+  --output  <dir>   Output directory            (default: results)
+  --batch   <N>     Images per batch            (default: 32)
+  --csv             Export CSVs
+  --verbose         Print per-image timing
   --help
 ```
 
-### Examples
+### Generate a larger dataset
 
 ```bash
-# Process sample boards, export CSVs, print timing
-./chess_vision --input data/sample_boards --output results --csv --verbose
-
-# Generate 200 boards and process them
 python3 scripts/generate_boards.py --count 200 --output data/boards_200
-./chess_vision --input data/boards_200 --output results --batch 32 --csv --verbose
-
-# Visualize intensity heatmaps (requires matplotlib)
-python3 scripts/visualize.py --results results/ --input data/sample_boards/ --output plots/
+./chess_vision --input data/boards_200 --output results --csv --verbose
 ```
 
 ---
 
-## GPU Pipeline
+## GPU pipeline in detail
 
 ```
 Input PNG
   │
-  ├─[CPU] libpng decode → RGB host buffer
-  ├─[CPU] cudaMemcpy H→D (pinned staging)
+  ├─[CPU]    libpng decode → RGB host buffer
+  ├─[CPU]    cudaMemcpy H→D
   │
-  ├─[NPP] nppiRGBToGray_8u_C3C1R          (RGB → grayscale)
-  ├─[NPP] nppiFilterGauss_8u_C1R          (3×3 Gaussian blur)
-  ├─[NPP] nppiFilterSobelHoriz_8u_C1R     (horizontal Sobel Gx)
-  ├─[NPP] nppiFilterSobelVert_8u_C1R      (vertical Sobel Gy)
-  ├─[CUDA kernel] k_combine_edges          (√(Gx²+Gy²), clamped)
-  ├─[NPP] nppiEqualizeHist_8u_C1R         (histogram equalization)
-  ├─[CUDA kernel] k_square_intensities     (8×8 shared-mem reduction)
+  ├─[NPP]    nppiRGBToGray_8u_C3C1R          RGB → grayscale
+  ├─[NPP]    nppiFilterGauss_8u_C1R          3×3 Gaussian blur
+  ├─[NPP]    nppiFilterSobelHoriz_8u_C1R     horizontal Sobel Gx
+  ├─[NPP]    nppiFilterSobelVert_8u_C1R      vertical Sobel Gy
+  ├─[kernel] k_combine_edges                 √(Gx²+Gy²) magnitude
+  ├─[kernel] k_histogram                     256-bin shared-mem histogram
+  ├─[kernel] k_apply_lut                     histogram equalization LUT
+  ├─[kernel] k_square_intensities            8×8 shared-mem reduction
   │
-  └─[CPU] cudaMemcpy D→H → PNG + CSV save
+  ├─[CPU]    cudaMemcpy D→H → save PNG + CSV
+  │
+  └─ (repeat for all N boards, then:)
+  │
+  ├─[cuBLAS] cublasSgemm   [Nx64] × [64x4] → [Nx4] feature scores
+  ├─[kernel] k_extract_pawn_row              extract pawn row signal
+  ├─[cuFFT]  cufftExecR2C  batch R2C FFT on pawn rows
+  ├─[kernel] k_fft_energy                   high-freq bin energy
+  ├─[kernel] k_aggregate_scores             dot [Nx4] with weights → [N]
+  └─[Thrust] sort_by_key   sort boards by score, assign ranks
 ```
-
-### Custom CUDA Kernels
-
-**`k_combine_edges`** — combines horizontal and vertical Sobel maps into gradient magnitude. Launched with 16×16 thread blocks covering the full image.
-
-**`k_square_intensities`** — divides the board into an 8×8 grid and computes average pixel intensity per square using shared memory parallel reduction. Launched with a grid of 8×8 blocks (one per chess square) and 16×16 threads per block.
 
 ---
 
-## Output
+## Output files
 
-For each input `board_NNN.png`, the pipeline writes:
-
-- `results/proc_board_NNN.png` — processed grayscale image (equalized edge map)
+For each input `board_NNN.png`:
+- `results/proc_board_NNN.png` — processed grayscale image
 - `results/intensity_board_NNN.csv` — 8×8 per-square intensity table
 
-### CSV format
+For the full batch:
+- `results/evaluation.csv` — ranked evaluation table with cuBLAS score and cuFFT pawn energy per board
+
+### evaluation.csv format
 
 ```
-rank,a,b,c,d,e,f,g,h
-8,42.17,198.83,41.92,...
-7,...
+rank,filename,score,material_proxy,pawn_fft_energy
+1,board_004.png,0.4821,0.9642,12.334
+2,board_007.png,0.4613,0.9226,14.112
 ...
-1,...
 ```
-
-Values are mean pixel intensities (0–255) per chess square after equalization. High values correspond to light squares; lower values indicate piece-occupied or dark squares.
 
 ---
 
 ## Performance (NVIDIA T4, 512×512 images)
 
-| Images | Total time | Throughput |
-|--------|-----------|------------|
-| 10     | ~0.06 s   | ~167 img/s |
-| 100    | ~0.18 s   | ~556 img/s |
-| 200    | ~0.31 s   | ~645 img/s |
-
-Timings exclude one-time CUDA context initialization (~150–300 ms).
-
----
-
-## Lessons Learned
-
-- **NPP border handling**: `nppiFilterGauss` and `nppiFilterSobel*` do not support in-place operation; separate input/output buffers are required.
-- **Pinned memory**: Using `cudaMallocHost` for staging buffers gives ~40% faster H↔D transfers vs pageable memory; for this project we kept it simple with regular malloc since transfer time is small relative to processing.
-- **Shared memory reduction**: The `k_square_intensities` kernel allocates 256 floats (1 KB) per block — well within the 48 KB shared memory limit, allowing all 64 blocks to run simultaneously on a T4.
-- **Batch size**: Processing 32 images per CPU loop iteration balances memory footprint and amortizes CUDA launch overhead. The GPU itself processes each image sequentially within the batch; a more advanced version would use CUDA streams to overlap H→D transfer of the next image with processing of the current one.
+| Stage          | 10 images | 200 images |
+|----------------|-----------|------------|
+| NPP pipeline   | ~28 ms    | ~560 ms    |
+| cuBLAS eval    | <1 ms     | <2 ms      |
+| cuFFT analysis | <1 ms     | <1 ms      |
+| Thrust sort    | <1 ms     | <1 ms      |
+| **Total**      | **~0.09 s** | **~0.58 s** |
 
 ---
 
-## Dataset
+## Lessons learned
 
-The 10 sample boards in `data/sample_boards/` were generated by `scripts/generate_boards.py` using only Python stdlib (no Pillow required). Each is a 512×512 PNG with randomized piece placement.
-
-To generate a larger dataset:
-
-```bash
-python3 scripts/generate_boards.py --count 200 --size 512 --output data/boards_200
-```
-
-Real chess board images can also be used — any PNG files work as input.
+- **NPP API stability**: `nppiEqualizeHist_8u_C1R` was removed in newer NPP versions — replaced with three portable custom kernels (histogram → LUT → apply) that work across all CUDA versions
+- **cuBLAS column-major**: cuBLAS uses Fortran/column-major layout; getting the `cublasSgemm` transpose arguments right to compute row-major [Nx64]×[64x4] requires transposing both operands mentally
+- **cuFFT batch mode**: `cufftPlanMany` with stride/distance parameters cleanly handles N independent 8-point FFTs in a single kernel call — much faster than N separate `cufftPlan1d` + execute calls
+- **Thrust with raw pointers**: `thrust::device_vector` wrapping raw `cudaMalloc` pointers via iterator construction avoids double-allocation while keeping Thrust's clean sort API
+- **gcc/nvcc version mismatch**: nvcc has a hard upper bound on supported gcc versions; the Makefile auto-detects gcc-12 and falls back to `-allow-unsupported-compiler` to avoid blocking the build on newer Linux distros
 
 ---
 

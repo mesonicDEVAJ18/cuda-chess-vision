@@ -1,114 +1,100 @@
 #!/usr/bin/env python3
 """
-visualize.py — Plot intensity heatmaps and side-by-side comparisons.
-
-Usage:
-    python3 scripts/visualize.py --results results/ --input data/sample_boards/ --output plots/
+visualize.py — plot intensity heatmaps and evaluation rankings
+Usage: python3 scripts/visualize.py --results results/ --output plots/
+Requires: matplotlib (pip install matplotlib)
 """
-
-import argparse
-import os
-import glob
-import struct
-import zlib
+import argparse, os, glob, csv
 
 try:
     import numpy as np
     import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
     HAS_MPL = True
 except ImportError:
     HAS_MPL = False
 
-
-def read_png_gray(path):
-    """Read a grayscale PNG using only stdlib (for environments without Pillow)."""
-    with open(path, 'rb') as f:
-        sig = f.read(8)
-        assert sig == b'\x89PNG\r\n\x1a\n', "Not a PNG"
-        data_chunks = b''
-        width = height = 0
-        while True:
-            length = struct.unpack('>I', f.read(4))[0]
-            ctype  = f.read(4)
-            chunk  = f.read(length)
-            f.read(4)  # CRC
-            if ctype == b'IHDR':
-                width, height = struct.unpack('>II', chunk[:8])
-            elif ctype == b'IDAT':
-                data_chunks += chunk
-            elif ctype == b'IEND':
-                break
-        raw = zlib.decompress(data_chunks)
-        stride = width + 1  # 1 filter byte per row
-        pixels = []
-        for y in range(height):
-            row = list(raw[y * stride + 1: y * stride + 1 + width])
-            pixels.append(row)
-        return pixels, width, height
-
-
-def read_csv_intensities(path):
+def read_csv(path):
     with open(path) as f:
-        lines = f.readlines()
-    grid = []
-    for line in lines[1:]:  # skip header
-        parts = line.strip().split(',')
-        grid.append([float(x) for x in parts[1:]])
-    return grid
+        reader = csv.DictReader(f)
+        return list(reader)
 
+def plot_heatmap(rows, title, outpath):
+    data = [[float(rows[r][c]) for c in 'abcdefgh'] for r in range(len(rows))]
+    fig, ax = plt.subplots(figsize=(5,4))
+    im = ax.imshow(data, cmap='plasma', vmin=0, vmax=255)
+    ax.set_xticks(range(8)); ax.set_xticklabels(list('abcdefgh'))
+    ax.set_yticks(range(8)); ax.set_yticklabels([str(r) for r in range(8,0,-1)])
+    ax.set_title(title, fontsize=10)
+    plt.colorbar(im, ax=ax, shrink=0.85, label='Mean intensity')
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=120); plt.close()
 
-def plot_heatmap_ascii(grid, label):
-    """ASCII fallback heatmap when matplotlib not available."""
+def plot_evaluation(rows, outpath):
+    names  = [r['filename'][:20] for r in rows[:10]]
+    scores = [float(r['score']) for r in rows[:10]]
+    pawns  = [float(r['pawn_fft_energy']) for r in rows[:10]]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    bars = ax1.barh(names[::-1], scores[::-1], color='steelblue')
+    ax1.set_xlabel('Evaluation Score'); ax1.set_title('Board Rankings (cuBLAS)')
+    ax1.bar_label(bars, fmt='%.3f', padding=3, fontsize=8)
+
+    ax2.barh(names[::-1], pawns[::-1], color='coral')
+    ax2.set_xlabel('FFT Energy'); ax2.set_title('Pawn Structure Complexity (cuFFT)')
+
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=120); plt.close()
+    print(f'  Saved: {outpath}')
+
+def ascii_heatmap(rows):
     chars = ' .,:;+*#@'
-    print(f"\n  Intensity heatmap: {label}")
     print("    a  b  c  d  e  f  g  h")
-    for r, row in enumerate(grid):
-        rank = 8 - r
+    for i, row in enumerate(rows):
+        rank = 8-i
         line = f"  {rank} "
-        for v in row:
-            idx = int(v / 255 * (len(chars) - 1))
-            line += chars[idx] * 2 + ' '
+        for c in 'abcdefgh':
+            v = float(row[c])
+            line += chars[int(v/255*(len(chars)-1))]*2+' '
         print(line)
 
-
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--results', default='results/')
-    parser.add_argument('--input',   default='data/sample_boards/')
-    parser.add_argument('--output',  default='plots/')
-    args = parser.parse_args()
-
-    csv_files = sorted(glob.glob(os.path.join(args.results, 'intensity_*.csv')))
-    print(f"Found {len(csv_files)} CSV files")
+    p = argparse.ArgumentParser()
+    p.add_argument('--results', default='results/')
+    p.add_argument('--output',  default='plots/')
+    a = p.parse_args()
 
     if not HAS_MPL:
-        print("matplotlib not available — showing ASCII heatmaps\n")
-        for csv in csv_files[:5]:
-            grid = read_csv_intensities(csv)
-            plot_heatmap_ascii(grid, os.path.basename(csv))
+        print("matplotlib not found — ASCII fallback\n")
+        for csv_path in sorted(glob.glob(os.path.join(a.results,'intensity_*.csv')))[:3]:
+            rows = read_csv(csv_path)
+            print(f'\n{os.path.basename(csv_path)}')
+            ascii_heatmap(rows)
+        eval_path = os.path.join(a.results,'evaluation.csv')
+        if os.path.exists(eval_path):
+            rows = read_csv(eval_path)
+            print('\nEvaluation rankings:')
+            print(f"  {'Rank':<5} {'File':<30} {'Score':>8} {'PawnFFT':>10}")
+            for r in rows[:10]:
+                print(f"  {r['rank']:<5} {r['filename']:<30} {float(r['score']):>8.4f} {float(r['pawn_fft_energy']):>10.4f}")
         return
 
-    os.makedirs(args.output, exist_ok=True)
+    os.makedirs(a.output, exist_ok=True)
 
-    for csv in csv_files:
-        grid = read_csv_intensities(csv)
-        arr  = np.array(grid)
-        name = os.path.splitext(os.path.basename(csv))[0]
+    # Intensity heatmaps
+    for csv_path in sorted(glob.glob(os.path.join(a.results,'intensity_*.csv'))):
+        rows = read_csv(csv_path)
+        name = os.path.splitext(os.path.basename(csv_path))[0]
+        out  = os.path.join(a.output, f'heatmap_{name}.png')
+        plot_heatmap(rows, name, out)
+        print(f'  Saved: {out}')
 
-        fig, ax = plt.subplots(figsize=(5, 4))
-        im = ax.imshow(arr, cmap='plasma', vmin=0, vmax=255, aspect='equal')
-        ax.set_xticks(range(8)); ax.set_xticklabels(list('abcdefgh'))
-        ax.set_yticks(range(8)); ax.set_yticklabels([str(r) for r in range(8, 0, -1)])
-        ax.set_title(name, fontsize=10)
-        plt.colorbar(im, ax=ax, label='Mean intensity (0–255)', shrink=0.85)
-        plt.tight_layout()
-        out = os.path.join(args.output, f'heatmap_{name}.png')
-        plt.savefig(out, dpi=120)
-        plt.close()
-        print(f"  Saved: {out}")
+    # Evaluation bar chart
+    eval_path = os.path.join(a.results,'evaluation.csv')
+    if os.path.exists(eval_path):
+        rows = read_csv(eval_path)
+        plot_evaluation(rows, os.path.join(a.output,'evaluation.png'))
 
-    print(f"\nAll plots in: {args.output}")
+    print(f'\nAll plots in: {a.output}')
 
-
-if __name__ == '__main__':
-    main()
+if __name__=='__main__': main()

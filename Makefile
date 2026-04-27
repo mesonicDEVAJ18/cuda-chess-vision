@@ -1,13 +1,14 @@
-# Makefile — CUDA Chess Vision
+# Makefile — CUDA Chess Vision (Capstone Edition)
+# GPU libraries: NPP, cuBLAS, cuFFT, Thrust
 #
 # Usage:
-#   make            build release binary
+#   make            build
 #   make debug      build with debug symbols
-#   make run        build and run on sample data
+#   make run        build + run on sample data
 #   make clean      remove build artifacts
 
 # ---------------------------------------------------------------------------
-# Auto-detect CUDA path
+# Auto-detect CUDA
 # ---------------------------------------------------------------------------
 ifndef CUDA_PATH
   NVCC_BIN := $(shell which nvcc 2>/dev/null)
@@ -16,67 +17,50 @@ ifndef CUDA_PATH
   else
     CUDA_PATH := $(firstword $(wildcard \
       /usr/local/cuda \
-      /usr/local/cuda-12.9 \
-      /usr/local/cuda-12.8 \
-      /usr/local/cuda-12.6 \
-      /usr/local/cuda-12.4 \
-      /usr/local/cuda-12.2 \
-      /usr/local/cuda-12.0 \
-      /usr/local/cuda-11.8 \
-      /usr/local/cuda-11.7 \
-      /usr/local/cuda-11.6 \
-      /usr/cuda \
-      /opt/cuda))
+      /usr/local/cuda-12.9 /usr/local/cuda-12.8 /usr/local/cuda-12.6 \
+      /usr/local/cuda-12.4 /usr/local/cuda-12.2 /usr/local/cuda-12.0 \
+      /usr/local/cuda-11.8 /usr/local/cuda-11.7 /usr/local/cuda-11.6 \
+      /usr/cuda /opt/cuda))
   endif
 endif
-
 ifeq ($(CUDA_PATH),)
   $(error Cannot find CUDA. Run: make CUDA_PATH=/usr/local/cuda-XX.X)
 endif
+$(info CUDA path : $(CUDA_PATH))
 
-$(info CUDA path: $(CUDA_PATH))
-
-NVCC = $(CUDA_PATH)/bin/nvcc
+NVCC        = $(CUDA_PATH)/bin/nvcc
+CUDA_LIBDIR = $(CUDA_PATH)/lib64
 
 # ---------------------------------------------------------------------------
-# Host compiler — prefer gcc-12 (max supported by most nvcc), fall back to gcc
+# Host compiler — prefer gcc-12, fall back with -allow-unsupported-compiler
 # ---------------------------------------------------------------------------
 ifndef HOSTCC
-  HOSTCC := $(firstword $(wildcard \
-    /usr/bin/gcc-12 \
-    /usr/local/bin/gcc-12) \
+  HOSTCC := $(firstword \
+    $(wildcard /usr/bin/gcc-12 /usr/local/bin/gcc-12) \
     $(shell which gcc-12 2>/dev/null))
 endif
-
 ifeq ($(HOSTCC),)
   HOSTCC      := $(firstword $(wildcard /usr/bin/gcc /usr/local/bin/gcc) \
                    $(shell which gcc 2>/dev/null))
   UNSUPPORTED := -allow-unsupported-compiler
-  $(info gcc-12 not found, using $(HOSTCC) with -allow-unsupported-compiler)
+  $(info Host CC  : $(HOSTCC) [with -allow-unsupported-compiler])
 else
   UNSUPPORTED :=
-  $(info Host compiler: $(HOSTCC))
+  $(info Host CC  : $(HOSTCC))
 endif
-
 ifeq ($(HOSTCC),)
   $(error Cannot find gcc. Run: sudo apt-get install build-essential)
 endif
 
 # ---------------------------------------------------------------------------
-# NPP libraries
-# CUDA 12.x split nppi into sub-libraries. Detect which ones exist.
+# NPP library detection (monolithic vs split layout)
 # ---------------------------------------------------------------------------
-CUDA_LIBDIR := $(CUDA_PATH)/lib64
-
-# nppi (older monolithic) vs split libs (newer)
 ifneq ($(wildcard $(CUDA_LIBDIR)/libnppi.so),)
   NPP_LIBS := -lnppc -lnppi
 else
-  # CUDA 12+ split layout — include all image-processing sub-libs
   NPP_LIBS := -lnppc -lnppig -lnppicc -lnppidei -lnppif -lnppim -lnppist -lnppisu -lnppitc -lnpps
 endif
-
-$(info NPP libs: $(NPP_LIBS))
+$(info NPP libs : $(NPP_LIBS))
 
 # ---------------------------------------------------------------------------
 # Flags
@@ -90,18 +74,25 @@ GENCODE = \
 
 NVCCFLAGS = -std=c++14 -O2 $(GENCODE) -ccbin $(HOSTCC) $(UNSUPPORTED) -Xcompiler -Wall
 CFLAGS    = -std=c11 -O2 -Wall -D_POSIX_C_SOURCE=200809L
-
 INCLUDES  = -I include -I $(CUDA_PATH)/include
 
-LDFLAGS   = -L $(CUDA_LIBDIR) $(NPP_LIBS) -lcudart -lpng -lm
+# -lstdc++ is required because Thrust uses C++ exceptions and stdlib internals
+# It must come AFTER the object files in the link order
+LDFLAGS   = \
+  -L $(CUDA_LIBDIR) \
+  $(NPP_LIBS) \
+  -lcublas \
+  -lcufft \
+  -lcudart \
+  -lpng -lm -lstdc++
 
 # ---------------------------------------------------------------------------
-# Sources and targets
+# Sources
 # ---------------------------------------------------------------------------
 BUILD_DIR = build
 BIN       = chess_vision
 
-CU_SRCS   = src/main.cu src/pipeline.cu
+CU_SRCS   = src/main.cu src/pipeline.cu src/evaluator.cu
 C_SRCS    = src/image_io.c
 
 CU_OBJS   = $(CU_SRCS:src/%.cu=$(BUILD_DIR)/%.o)
@@ -130,7 +121,6 @@ $(BIN): $(ALL_OBJS)
 	@echo ""
 	@echo "  Build successful: ./$(BIN)"
 	@echo "  Quick run: make run"
-	@echo "  Full help: ./$(BIN) --help"
 	@echo ""
 
 run: all

@@ -1,4 +1,14 @@
-// pipeline.cu — GPU image processing pipeline
+// pipeline.cu — DEPRECATED
+//
+// This file has been superseded by src/compression.cu in the redesigned pipeline.
+// It is kept for reference only and is NOT compiled (see Makefile CU_SRCS).
+//
+// The new pipeline:
+//   Stage 1: board_gen.cu    — cuRAND random legal board generation
+//   Stage 2: compression.cu  — NPP + block-DCT JPEG-style compression
+//   Stage 3: evaluator.cu    — cuBLAS + cuFFT + Thrust board evaluation
+//
+// DEPRECATED — pipeline.cu — original GPU image processing pipeline
 // NPP: RGBToGray, GaussBlur, SobelX, SobelY
 // Custom kernels: edge combination, histogram equalization, per-square intensities
 

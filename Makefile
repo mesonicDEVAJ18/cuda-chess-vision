@@ -1,38 +1,58 @@
-# Makefile — CUDA Chess Vision (Capstone Edition)
-# GPU libraries: NPP, cuBLAS, cuFFT, Thrust
+# Makefile — CUDA Chess Vision (Redesigned)
+#
+# Three-stage pipeline:
+#   Stage 1 : board_gen.cu    — cuRAND position generation
+#   Stage 2 : compression.cu  — NPP + block-DCT compression
+#   Stage 3 : evaluator.cu    — cuBLAS + cuFFT + Thrust evaluation
 #
 # Usage:
-#   make            build
-#   make debug      build with debug symbols
-#   make run        build + run on sample data
-#   make clean      remove build artifacts
+#   make              build
+#   make run          build + run (20 boards, Q=50)
+#   make run-large    build + run (100 boards)
+#   make viz          run visualise.py on last results
+#   make clean        remove build artefacts
 
 # ---------------------------------------------------------------------------
-# Auto-detect CUDA
+# CUDA / nvcc detection
+# Two layouts supported:
+#   A) System install (Ubuntu 22.04 nvidia-cuda-toolkit):
+#      nvcc at /usr/bin/nvcc, headers in /usr/include, libs in /usr/lib/...
+#   B) Upstream installer: nvcc at /usr/local/cuda/bin/nvcc
 # ---------------------------------------------------------------------------
-ifndef CUDA_PATH
-  NVCC_BIN := $(shell which nvcc 2>/dev/null)
-  ifneq ($(NVCC_BIN),)
-    CUDA_PATH := $(abspath $(dir $(NVCC_BIN))..)
-  else
-    CUDA_PATH := $(firstword $(wildcard \
-      /usr/local/cuda \
-      /usr/local/cuda-12.9 /usr/local/cuda-12.8 /usr/local/cuda-12.6 \
-      /usr/local/cuda-12.4 /usr/local/cuda-12.2 /usr/local/cuda-12.0 \
-      /usr/local/cuda-11.8 /usr/local/cuda-11.7 /usr/local/cuda-11.6 \
-      /usr/cuda /opt/cuda))
-  endif
+NVCC := $(shell which nvcc 2>/dev/null)
+ifeq ($(NVCC),)
+  NVCC := $(firstword $(wildcard \
+    /usr/local/cuda/bin/nvcc \
+    /usr/local/cuda-12.0/bin/nvcc \
+    /usr/local/cuda-11.8/bin/nvcc))
 endif
-ifeq ($(CUDA_PATH),)
-  $(error Cannot find CUDA. Run: make CUDA_PATH=/usr/local/cuda-XX.X)
+ifeq ($(NVCC),)
+  $(error Cannot find nvcc. Install CUDA toolkit first.)
 endif
-$(info CUDA path : $(CUDA_PATH))
+$(info nvcc     : $(NVCC))
 
-NVCC        = $(CUDA_PATH)/bin/nvcc
-CUDA_LIBDIR = $(CUDA_PATH)/lib64
+# Derive CUDA_PATH from nvcc location (works for both layouts)
+NVCC_DIR  := $(dir $(NVCC))
+CUDA_PATH := $(abspath $(NVCC_DIR)/..)
+$(info CUDA_PATH: $(CUDA_PATH))
+
+# Library directory — system layout puts libs in /usr/lib/x86_64-linux-gnu
+# upstream puts them in $(CUDA_PATH)/lib64
+CUDA_LIBDIR := $(CUDA_PATH)/lib64
+ifeq ($(wildcard $(CUDA_LIBDIR)/libcudart.so),)
+  CUDA_LIBDIR := /usr/lib/x86_64-linux-gnu
+endif
+$(info lib dir  : $(CUDA_LIBDIR))
+
+# Include directory — system layout uses /usr/include
+CUDA_INC := $(CUDA_PATH)/include
+ifeq ($(wildcard $(CUDA_INC)/cuda_runtime.h),)
+  CUDA_INC := /usr/include
+endif
+$(info inc dir  : $(CUDA_INC))
 
 # ---------------------------------------------------------------------------
-# Host compiler — prefer gcc-12, fall back with -allow-unsupported-compiler
+# Host compiler
 # ---------------------------------------------------------------------------
 ifndef HOSTCC
   HOSTCC := $(firstword \
@@ -49,57 +69,72 @@ else
   $(info Host CC  : $(HOSTCC))
 endif
 ifeq ($(HOSTCC),)
-  $(error Cannot find gcc. Run: sudo apt-get install build-essential)
+  $(error Cannot find gcc.)
 endif
 
 # ---------------------------------------------------------------------------
-# NPP library detection (monolithic vs split layout)
+# NPP library detection (monolithic vs split vs system path)
 # ---------------------------------------------------------------------------
 ifneq ($(wildcard $(CUDA_LIBDIR)/libnppi.so),)
   NPP_LIBS := -lnppc -lnppi
 else
-  NPP_LIBS := -lnppc -lnppig -lnppicc -lnppidei -lnppif -lnppim -lnppist -lnppisu -lnppitc -lnpps
+  # System or split layout — include all component libraries
+  NPP_LIBS := -lnppc -lnppig -lnppicc -lnppidei -lnppif \
+              -lnppim -lnppist -lnppisu -lnppitc -lnpps -lnppial
 endif
 $(info NPP libs : $(NPP_LIBS))
 
 # ---------------------------------------------------------------------------
-# Flags
+# GPU architecture targets
 # ---------------------------------------------------------------------------
 GENCODE = \
   -gencode arch=compute_60,code=sm_60 \
   -gencode arch=compute_70,code=sm_70 \
   -gencode arch=compute_75,code=sm_75 \
   -gencode arch=compute_80,code=sm_80 \
-  -gencode arch=compute_86,code=sm_86
+  -gencode arch=compute_86,code=sm_86 \
+  -gencode arch=compute_89,code=sm_89
 
-NVCCFLAGS = -std=c++14 -O2 $(GENCODE) -ccbin $(HOSTCC) $(UNSUPPORTED) -Xcompiler -Wall
+# ---------------------------------------------------------------------------
+# Compiler flags
+# ---------------------------------------------------------------------------
+NVCCFLAGS = -std=c++14 -O2 $(GENCODE) -ccbin $(HOSTCC) $(UNSUPPORTED) \
+            -Xcompiler -Wall
 CFLAGS    = -std=c11 -O2 -Wall -D_POSIX_C_SOURCE=200809L
-INCLUDES  = -I include -I $(CUDA_PATH)/include
+INCLUDES  = -I include -I $(CUDA_INC)
 
-# -lstdc++ is required because Thrust uses C++ exceptions and stdlib internals
-# It must come AFTER the object files in the link order
-LDFLAGS   = \
+# System layout: libs are already on the linker's default search path,
+# but we add $(CUDA_LIBDIR) explicitly for good measure.
+# -lstdc++ is required for Thrust.
+LDFLAGS = \
   -L $(CUDA_LIBDIR) \
   $(NPP_LIBS) \
-  -lcublas \
+  -lcublas_static -lcublasLt_static -lculibos \
   -lcufft \
   -lcudart \
   -lpng -lm -lstdc++
 
 # ---------------------------------------------------------------------------
-# Sources
+# Sources & objects
 # ---------------------------------------------------------------------------
 BUILD_DIR = build
 BIN       = chess_vision
 
-CU_SRCS   = src/main.cu src/pipeline.cu src/evaluator.cu
-C_SRCS    = src/image_io.c
+CU_SRCS = src/main.cu \
+          src/board_gen.cu \
+          src/compression.cu \
+          src/evaluator.cu
 
-CU_OBJS   = $(CU_SRCS:src/%.cu=$(BUILD_DIR)/%.o)
-C_OBJS    = $(C_SRCS:src/%.c=$(BUILD_DIR)/%.o)
-ALL_OBJS  = $(CU_OBJS) $(C_OBJS)
+C_SRCS  = src/image_io.c
 
-.PHONY: all debug run clean
+CU_OBJS = $(CU_SRCS:src/%.cu=$(BUILD_DIR)/%.o)
+C_OBJS  = $(C_SRCS:src/%.c=$(BUILD_DIR)/%.o)
+ALL_OBJS = $(CU_OBJS) $(C_OBJS)
+
+# ---------------------------------------------------------------------------
+# Targets
+# ---------------------------------------------------------------------------
+.PHONY: all debug run run-large viz clean
 
 all: $(BUILD_DIR) $(BIN)
 
@@ -119,13 +154,20 @@ $(BUILD_DIR)/%.o: src/%.c
 $(BIN): $(ALL_OBJS)
 	$(NVCC) $(GENCODE) -ccbin $(HOSTCC) $(UNSUPPORTED) $^ -o $@ $(LDFLAGS)
 	@echo ""
-	@echo "  Build successful: ./$(BIN)"
-	@echo "  Quick run: make run"
+	@echo "  ✓  Build successful: ./$(BIN)"
+	@echo "  →  Quick run: make run"
 	@echo ""
 
 run: all
-	mkdir -p results
-	./$(BIN) --input data/sample_boards --output results --csv --verbose
+	mkdir -p results/boards results/compressed
+	./$(BIN) --boards 20 --quality 50 --output results --verbose
+
+run-large: all
+	mkdir -p results/boards results/compressed
+	./$(BIN) --boards 100 --quality 50 --output results --verbose
+
+viz:
+	python3 scripts/visualize.py --results results --output plots
 
 clean:
-	rm -rf $(BUILD_DIR) $(BIN) results
+	rm -rf $(BUILD_DIR) $(BIN) results plots

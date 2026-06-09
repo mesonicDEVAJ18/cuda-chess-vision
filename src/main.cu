@@ -1,202 +1,284 @@
+// main.cu — CUDA Chess Vision entry point
+//
+// Three-stage GPU pipeline:
+//
+//   Stage 1 — Board Generation  (board_gen.cu / cuRAND)
+//     Generate N random legal chess positions on the GPU.
+//     Render each board to a color PNG in results/boards/.
+//
+//   Stage 2 — DCT Compression   (compression.cu / NPP + custom kernels)
+//     GPU block-DCT compress each board image (JPEG-style).
+//     Save reconstructed image to results/compressed/.
+//     Record PSNR and non-zero coefficient ratio in results/compression.csv.
+//
+//   Stage 3 — Board Evaluation  (evaluator.cu / cuBLAS + cuFFT + Thrust)
+//     Evaluate each board from its piece-state (not image pixels).
+//     Piece-square tables in constant memory, cuBLAS spatial features,
+//     cuFFT pawn structure, Thrust ranking.
+//     Results in results/evaluation.csv.
+
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
-#include "image_io.h"
-#include "pipeline.h"
+#include "board_gen.h"
+#include "compression.h"
 #include "evaluator.h"
+#include "image_io.h"
 
-static void usage(const char *prog) {
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
+static void usage(const char *prog)
+{
     fprintf(stderr,
-        "Usage: %s --input <dir> [OPTIONS]\n"
-        "\n"
+        "Usage: %s [OPTIONS]\n\n"
         "Options:\n"
-        "  --input   <dir>   PNG image directory        (required)\n"
-        "  --output  <dir>   Output directory            (default: results)\n"
-        "  --batch   <N>     Images per batch            (default: 32)\n"
-        "  --csv             Export CSVs\n"
-        "  --verbose         Print per-image timing\n"
+        "  --boards  <N>   Number of boards to generate      (default: 20)\n"
+        "  --quality <Q>   DCT compression quality 1-100     (default: 50)\n"
+        "  --output  <dir> Output root directory             (default: results)\n"
+        "  --seed    <S>   cuRAND seed                       (default: 42)\n"
+        "  --top     <N>   Boards to show in summary table   (default: 5)\n"
+        "  --verbose       Print per-board timing\n"
         "  --help\n",
         prog);
 }
 
-static void print_gpu_info(void) {
-    // Warm up MUST happen before device queries
-    cudaError_t err = cudaFree(0);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[WARN] CUDA init: %s\n", cudaGetErrorString(err));
+static void mkdirp(const char *path)
+{
+#ifdef _WIN32
+    mkdir(path);
+#else
+    mkdir(path, 0755);
+#endif
+}
+
+static void print_gpu_info(void)
+{
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
+        printf("  GPU  : [not available in this environment]\n\n");
         return;
     }
-    int dev; cudaDeviceProp p;
+    int dev = 0; cudaDeviceProp p;
     cudaGetDevice(&dev);
     cudaGetDeviceProperties(&p, dev);
-    printf("GPU : %s\n", p.name);
-    printf("SMs : %d  |  Memory: %.1f GiB  |  Compute: %d.%d\n\n",
+    printf("  GPU  : %s\n", p.name);
+    printf("  SMs  : %d  |  VRAM : %.1f GiB  |  Compute : %d.%d\n\n",
            p.multiProcessorCount,
            (double)p.totalGlobalMem / (1 << 30),
            p.major, p.minor);
 }
 
-int main(int argc, char **argv) {
-    const char *input_dir  = NULL;
-    const char *output_dir = "results";
-    int         batch_size = 32;
-    int         export_csv = 0;
-    int         verbose    = 0;
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+int main(int argc, char **argv)
+{
+    int   n_boards  = 20;
+    int   quality   = 50;
+    int   top_n     = 5;
+    int   verbose   = 0;
+    unsigned long long seed = 42ULL;
+    const char *out_root = "results";
 
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "--input")  && i+1 < argc) input_dir  = argv[++i];
-        else if (!strcmp(argv[i], "--output") && i+1 < argc) output_dir = argv[++i];
-        else if (!strcmp(argv[i], "--batch")  && i+1 < argc) batch_size = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--csv"))                   export_csv = 1;
-        else if (!strcmp(argv[i], "--verbose"))               verbose    = 1;
-        else if (!strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
-        else { fprintf(stderr, "Unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
+        if      (!strcmp(argv[i],"--boards")  && i+1<argc) n_boards  = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--quality") && i+1<argc) quality   = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--output")  && i+1<argc) out_root  = argv[++i];
+        else if (!strcmp(argv[i],"--seed")    && i+1<argc) seed      = (unsigned long long)atoll(argv[++i]);
+        else if (!strcmp(argv[i],"--top")     && i+1<argc) top_n     = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--verbose"))              verbose   = 1;
+        else if (!strcmp(argv[i],"--help"))   { usage(argv[0]); return 0; }
+        else { fprintf(stderr,"Unknown arg: %s\n",argv[i]); usage(argv[0]); return 1; }
     }
-    if (!input_dir) { fprintf(stderr, "Error: --input required\n"); usage(argv[0]); return 1; }
 
-    print_gpu_info();
-    mkdir(output_dir, 0755);
+    if (quality < 1)   quality = 1;
+    if (quality > 100) quality = 100;
+    if (top_n > n_boards) top_n = n_boards;
 
-    // Collect images
-    int    n_images = 0;
-    char **paths    = collect_png_files(input_dir, &n_images);
-    if (n_images == 0) { fprintf(stderr, "No PNG files in: %s\n", input_dir); return 1; }
-    printf("Images : %d  |  Batch: %d\n\n", n_images, batch_size);
-
-    // Print first few paths so we can verify they look correct
-    printf("Sample paths:\n");
-    for (int i = 0; i < n_images && i < 3; i++)
-        printf("  [%d] %s\n", i, paths[i]);
     printf("\n");
+    printf("╔══════════════════════════════════════════════════╗\n");
+    printf("║        CUDA Chess Vision  (Redesigned)           ║\n");
+    printf("║  Stage1: cuRAND  Stage2: DCT  Stage3: cuBLAS     ║\n");
+    printf("╚══════════════════════════════════════════════════╝\n\n");
+    print_gpu_info();
 
-    // Allocate storage for all board intensities
-    float      *all_intensities = (float *)    malloc(n_images * 64 * sizeof(float));
-    const char **all_filenames  = (const char **)malloc(n_images * sizeof(char *));
-    BoardEval  *all_evals       = (BoardEval *) malloc(n_images * sizeof(BoardEval));
+    // Create output directories
+    char dir_boards[1024], dir_comp[1024];
+    snprintf(dir_boards, sizeof(dir_boards), "%s/boards",     out_root);
+    snprintf(dir_comp,   sizeof(dir_comp),   "%s/compressed", out_root);
+    mkdirp(out_root);
+    mkdirp(dir_boards);
+    mkdirp(dir_comp);
 
-    cudaEvent_t ev0, ev1;
-    cudaEventCreate(&ev0);
-    cudaEventCreate(&ev1);
-    cudaEventRecord(ev0);
-
-    int processed = 0;
+    // Arrays for all boards
+    float      *all_states    = (float *)     malloc(n_boards * 64 * sizeof(float));
+    const char **all_filenames= (const char **)malloc(n_boards * sizeof(char *));
+    char       **fname_buf    = (char **)      malloc(n_boards * sizeof(char *));
+    for (int i = 0; i < n_boards; i++) {
+        fname_buf[i] = (char *)malloc(1024);
+        snprintf(fname_buf[i], 1024, "%s/board_%03d.png", dir_boards, i);
+        all_filenames[i] = fname_buf[i];
+    }
+    BoardEval  *all_evals = (BoardEval *)malloc(n_boards * sizeof(BoardEval));
 
     // -------------------------------------------------------------------------
-    // Stage 1: NPP image pipeline
+    // Stage 1 — Board Generation (cuRAND)
     // -------------------------------------------------------------------------
-    printf("=== Stage 1: Image Pipeline (NPP + custom kernels) ===\n");
-    for (int b = 0; b < n_images; b += batch_size) {
-        int end = b + batch_size < n_images ? b + batch_size : n_images;
+    printf("══════════════════════════════════════════════════════\n");
+    printf(" Stage 1 │ Board Generation (cuRAND)\n");
+    printf("══════════════════════════════════════════════════════\n");
+    printf("  Generating %d random legal positions on GPU (seed=%llu)…\n",
+           n_boards, seed);
 
-        for (int i = b; i < end; i++) {
-            cudaEvent_t t0, t1;
-            if (verbose) { cudaEventCreate(&t0); cudaEventCreate(&t1); cudaEventRecord(t0); }
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0); cudaEventCreate(&t1);
+    cudaEventRecord(t0);
 
-            Image img = {0};
-            if (!image_load_png(paths[i], &img)) {
-                fprintf(stderr, "  [SKIP] Failed to load: %s\n", paths[i]);
-                continue;
-            }
-
-            PipelineResult res = {0};
-            int ok = pipeline_run(&img, &res);
-            image_free(&img);
-            if (!ok) {
-                fprintf(stderr, "  [SKIP] Pipeline failed: %s\n", paths[i]);
-                continue;
-            }
-
-            // Save processed image
-            const char *bn = strrchr(paths[i], '/');
-            bn = bn ? bn + 1 : paths[i];
-            char out_img[2048];
-            snprintf(out_img, sizeof(out_img), "%s/proc_%s", output_dir, bn);
-            image_save_png_gray(out_img, res.gray, res.width, res.height);
-
-            if (export_csv) {
-                char base[512];
-                strncpy(base, bn, 511); base[511] = '\0';
-                char *dot = strrchr(base, '.'); if (dot) *dot = '\0';
-                char out_csv[2048];
-                snprintf(out_csv, sizeof(out_csv), "%s/intensity_%s.csv", output_dir, base);
-                save_intensity_csv(out_csv, res.intensities);
-            }
-
-            memcpy(all_intensities + processed * 64, res.intensities, 64 * sizeof(float));
-            all_filenames[processed] = paths[i];
-            pipeline_result_free(&res);
-
-            if (verbose) {
-                cudaEventRecord(t1); cudaEventSynchronize(t1);
-                float ms = 0; cudaEventElapsedTime(&ms, t0, t1);
-                printf("  [%3d/%d] %-36s  %.2f ms\n", processed + 1, n_images, bn, ms);
-                cudaEventDestroy(t0); cudaEventDestroy(t1);
-            }
-            processed++;
-        }
-
-        printf("  Batch %d/%d done (%d processed)\n",
-               b / batch_size + 1,
-               (n_images + batch_size - 1) / batch_size,
-               processed);
+    ChessBoard *boards = boards_generate_gpu(n_boards, seed);
+    if (!boards) {
+        fprintf(stderr, "  [ERROR] Board generation failed\n"); return 1;
     }
 
-    // -------------------------------------------------------------------------
-    // Stage 2: cuBLAS + cuFFT + Thrust evaluation
-    // -------------------------------------------------------------------------
-    printf("\n=== Stage 2: Board Evaluation (cuBLAS + cuFFT + Thrust) ===\n");
-    if (processed > 0) {
-        int ok = evaluator_run(all_intensities, all_filenames, processed, all_evals);
-        if (ok) {
-            printf("  Evaluated %d boards\n", processed);
-            printf("\n  Top 5 boards by GPU evaluation score:\n");
-            printf("  %-4s %-30s %8s %10s\n", "Rank", "File", "Score", "PawnFFT");
+    cudaEventRecord(t1); cudaEventSynchronize(t1);
+    float ms1 = 0; cudaEventElapsedTime(&ms1, t0, t1);
 
-            for (int rank = 0; rank < 5 && rank < processed; rank++) {
-                for (int i = 0; i < processed; i++) {
-                    if (all_evals[i].rank == rank) {
-                        const char *bn = strrchr(all_evals[i].filename, '/');
-                        bn = bn ? bn + 1 : all_evals[i].filename;
-                        printf("  #%-3d %-30s %8.4f %10.4f\n",
-                               rank + 1, bn,
-                               all_evals[i].score,
-                               all_evals[i].pawn_structure);
-                    }
+    // Render PNGs + convert to float arrays
+    int rendered = 0;
+    for (int i = 0; i < n_boards; i++) {
+        board_to_floats(&boards[i], all_states + i * 64);
+        if (board_save_png(fname_buf[i], &boards[i], 512)) {
+            rendered++;
+            if (verbose) printf("  [%3d/%d] %s\n", i+1, n_boards, fname_buf[i]);
+        } else {
+            fprintf(stderr, "  [WARN] Failed to render board %d\n", i);
+        }
+    }
+    free(boards);
+
+    printf("  Rendered  : %d boards → %s/\n", rendered, dir_boards);
+    printf("  GPU time  : %.2f ms  (%.0f boards/s)\n\n",
+           ms1, n_boards / (ms1 / 1000.f));
+
+    // -------------------------------------------------------------------------
+    // Stage 2 — DCT Compression (NPP + custom kernels)
+    // -------------------------------------------------------------------------
+    printf("══════════════════════════════════════════════════════\n");
+    printf(" Stage 2 │ DCT Compression (NPP + Block-DCT kernels)\n");
+    printf("══════════════════════════════════════════════════════\n");
+    printf("  Quality : Q=%d  |  Compressing %d boards…\n", quality, rendered);
+
+    char comp_csv[1024];
+    snprintf(comp_csv, sizeof(comp_csv), "%s/compression.csv", out_root);
+
+    float total_psnr = 0.f; int comp_count = 0;
+    cudaEventRecord(t0);
+
+    for (int i = 0; i < n_boards; i++) {
+        Image img = {0};
+        if (!image_load_png(fname_buf[i], &img)) continue;
+
+        CompressedImage c = {0};
+        if (!compression_run(&img, quality, &c)) {
+            image_free(&img); continue;
+        }
+        image_free(&img);
+
+        char cpath[1024];
+        snprintf(cpath, sizeof(cpath), "%s/board_%03d.png", dir_comp, i);
+        compression_save_png(cpath, &c);
+
+        const char *bn = strrchr(fname_buf[i], '/');
+        bn = bn ? bn+1 : fname_buf[i];
+        compression_csv_append(comp_csv, bn, quality, c.psnr, c.ratio);
+
+        total_psnr += c.psnr;
+        comp_count++;
+
+        if (verbose)
+            printf("  [%3d/%d] PSNR=%.1f dB  coeff_density=%.1f%%  → %s\n",
+                   i+1, n_boards, c.psnr, c.ratio*100.f, cpath);
+
+        compression_free(&c);
+    }
+
+    cudaEventRecord(t1); cudaEventSynchronize(t1);
+    float ms2 = 0; cudaEventElapsedTime(&ms2, t0, t1);
+
+    if (comp_count > 0) {
+        printf("  Avg PSNR  : %.2f dB\n", total_psnr / comp_count);
+        printf("  Saved     : %s\n", comp_csv);
+    }
+    printf("  GPU time  : %.2f ms\n\n", ms2);
+
+    // -------------------------------------------------------------------------
+    // Stage 3 — Board Evaluation (cuBLAS + cuFFT + Thrust)
+    // -------------------------------------------------------------------------
+    printf("══════════════════════════════════════════════════════\n");
+    printf(" Stage 3 │ Board Evaluation (cuBLAS + cuFFT + Thrust)\n");
+    printf("══════════════════════════════════════════════════════\n");
+    printf("  Evaluating %d boards…\n", rendered);
+
+    cudaEventRecord(t0);
+    int eval_ok = evaluator_run(all_states, all_filenames, n_boards, all_evals);
+    cudaEventRecord(t1); cudaEventSynchronize(t1);
+    float ms3 = 0; cudaEventElapsedTime(&ms3, t0, t1);
+
+    if (eval_ok) {
+        printf("  GPU time  : %.2f ms\n\n", ms3);
+
+        // Top-N table
+        printf("  ┌─────┬──────────────────────┬────────┬──────────┬──────────┬──────────┐\n");
+        printf("  │Rank │ File                 │ Score  │ Material │ Position │ PawnFFT  │\n");
+        printf("  ├─────┼──────────────────────┼────────┼──────────┼──────────┼──────────┤\n");
+
+        for (int rank = 0; rank < top_n; rank++) {
+            for (int i = 0; i < n_boards; i++) {
+                if (all_evals[i].rank == rank) {
+                    const char *bn = strrchr(all_evals[i].filename, '/');
+                    bn = bn ? bn+1 : all_evals[i].filename;
+                    printf("  │ #%-3d│ %-20.20s │%7.3f │%9.3f │%9.3f │%9.3f │\n",
+                           rank+1, bn,
+                           all_evals[i].score,
+                           all_evals[i].material,
+                           all_evals[i].positional,
+                           all_evals[i].pawn_structure);
                 }
             }
-
-            if (export_csv) {
-                char eval_csv[2048];
-                snprintf(eval_csv, sizeof(eval_csv), "%s/evaluation.csv", output_dir);
-                evaluator_save_csv(eval_csv, all_evals, processed);
-                printf("\n  Saved: %s\n", eval_csv);
-            }
-        } else {
-            fprintf(stderr, "  [ERROR] Evaluation failed\n");
         }
+        printf("  └─────┴──────────────────────┴────────┴──────────┴──────────┴──────────┘\n\n");
+
+        char eval_csv[1024];
+        snprintf(eval_csv, sizeof(eval_csv), "%s/evaluation.csv", out_root);
+        evaluator_save_csv(eval_csv, all_evals, n_boards);
+        printf("  Saved     : %s\n\n", eval_csv);
     } else {
-        printf("  Skipped (0 images processed in Stage 1)\n");
+        fprintf(stderr, "  [ERROR] Evaluation failed\n\n");
     }
 
     // -------------------------------------------------------------------------
     // Summary
     // -------------------------------------------------------------------------
-    cudaEventRecord(ev1); cudaEventSynchronize(ev1);
-    float total_ms = 0; cudaEventElapsedTime(&total_ms, ev0, ev1);
+    printf("══════════════════════════════════════════════════════\n");
+    printf(" Summary\n");
+    printf("══════════════════════════════════════════════════════\n");
+    printf("  Boards generated  : %d\n", n_boards);
+    printf("  Boards rendered   : %d  →  %s/\n", rendered, dir_boards);
+    printf("  Boards compressed : %d  →  %s/\n", comp_count, dir_comp);
+    printf("  Stage 1 (cuRAND)  : %.2f ms\n", ms1);
+    printf("  Stage 2 (DCT)     : %.2f ms\n", ms2);
+    printf("  Stage 3 (eval)    : %.2f ms\n", ms3);
+    printf("  Total GPU time    : %.2f ms\n", ms1 + ms2 + ms3);
+    printf("\n  Visualise: python3 scripts/visualize.py --results %s\n\n",
+           out_root);
 
-    printf("\n=== Summary ===\n");
-    printf("Processed  : %d / %d images\n", processed, n_images);
-    printf("GPU time   : %.2f s\n", total_ms / 1000.0f);
-    if (processed > 0)
-        printf("Throughput : %.1f img/s\n", processed / (total_ms / 1000.0f));
-    printf("Output dir : %s/\n", output_dir);
-
-    cudaEventDestroy(ev0); cudaEventDestroy(ev1);
-    free(all_intensities); free(all_filenames); free(all_evals);
-    for (int i = 0; i < n_images; i++) free(paths[i]);
-    free(paths);
+    // Cleanup
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    free(all_states); free(all_evals); free(all_filenames);
+    for (int i = 0; i < n_boards; i++) free(fname_buf[i]);
+    free(fname_buf);
     return 0;
 }

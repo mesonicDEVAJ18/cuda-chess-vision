@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
-# run.sh — build and run CUDA Chess Vision
+# run.sh — CUDA Chess Vision full pipeline
+# Usage: ./run.sh [--boards N] [--quality Q] [--large]
 set -e
 
-echo "================================================"
-echo "  CUDA Chess Vision — Capstone Edition"
-echo "  GPU libs: NPP | cuBLAS | cuFFT | Thrust"
-echo "================================================"
+BOARDS=20
+QUALITY=50
+LARGE=0
+
+for arg in "$@"; do
+  case $arg in
+    --boards)  shift; BOARDS=$1  ;;
+    --quality) shift; QUALITY=$1 ;;
+    --large)   BOARDS=100        ;;
+  esac
+  shift 2>/dev/null || true
+done
+
+echo ""
+echo "╔══════════════════════════════════════════════════╗"
+echo "║        CUDA Chess Vision  —  run.sh              ║"
+echo "╚══════════════════════════════════════════════════╝"
 echo ""
 
 # Auto-find nvcc if not in PATH
@@ -14,23 +28,33 @@ if ! which nvcc &>/dev/null; then
     if [ -x "$d/nvcc" ]; then
       export PATH="$d:$PATH"
       export CUDA_PATH="$(dirname $d)"
-      echo "Found CUDA at: $CUDA_PATH"
+      echo "  Found CUDA at: $CUDA_PATH"
       break
     fi
   done
 fi
 
-make all
-
+echo "  Building…"
+make all 2>&1 | tail -5
 echo ""
-mkdir -p results
+
+echo "  Running pipeline (boards=$BOARDS, quality=$QUALITY)…"
 ./chess_vision \
-    --input   data/boards_200 \
-    --output  results \
-    --batch   32 \
-    --csv \
+    --boards  "$BOARDS"  \
+    --quality "$QUALITY" \
+    --output  results    \
     --verbose
 
 echo ""
-echo "--- Output files ---"
-ls results/
+echo "  Generating plots…"
+python3 scripts/visualize.py --results results --output plots || \
+  echo "  (Install matplotlib for plots: pip install matplotlib numpy)"
+
+echo ""
+echo "  Output:"
+echo "    results/boards/       — rendered board PNGs"
+echo "    results/compressed/   — DCT-compressed board PNGs"
+echo "    results/evaluation.csv"
+echo "    results/compression.csv"
+echo "    plots/                — matplotlib figures"
+echo ""

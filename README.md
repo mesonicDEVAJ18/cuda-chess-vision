@@ -1,5 +1,7 @@
 # CUDA Chess Vision
 
+![Infographic](insta_post.png)
+
 GPU-accelerated chess board generation, block-DCT compression, and position evaluation pipeline using four CUDA GPU libraries working together: **cuRAND**, **NPP**, **cuBLAS**, **cuFFT**, and **Thrust**.
 
 ---
@@ -39,7 +41,6 @@ cuda-chess-vision/
 │   ├── compression.cu
 │   ├── evaluator.cu
 │   ├── image_io.c
-│   └── pipeline.cu         # (Deprecated old pipeline)
 ├── scripts/
 │   └── visualize.py        # Generate matplotlib plots from results
 ├── plots/                  # Generated visualizations
